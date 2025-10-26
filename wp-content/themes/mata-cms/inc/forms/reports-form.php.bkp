@@ -1,0 +1,489 @@
+<?php
+// Get the absolute path to the WordPress installation
+$wordpress_path = dirname(dirname(dirname(dirname(dirname(dirname(__FILE__)))))); // Adjust as needed
+
+// Include PHPMailer from WordPress
+if (!class_exists('PHPMailer\PHPMailer\PHPMailer')) {
+    require_once $wordpress_path . '/wp-includes/PHPMailer/PHPMailer.php';
+    require_once $wordpress_path . '/wp-includes/PHPMailer/SMTP.php';
+    require_once $wordpress_path . '/wp-includes/PHPMailer/Exception.php';
+}
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+
+
+// 1. Update database table structure
+register_activation_hook(__FILE__, 'create_submissions_table');
+function create_submissions_table() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'form_submissions';
+    
+    $sql = "CREATE TABLE $table_name (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        name varchar(100) NOT NULL,
+        email varchar(100) NOT NULL,
+        phone varchar(20) NOT NULL,
+        experience varchar(50) NOT NULL,
+        industry varchar(50) NOT NULL,
+        outcomes varchar(50) NOT NULL,
+        dedication varchar(50) NOT NULL,
+        salary varchar(50) NOT NULL,
+        otp varchar(6) NOT NULL,
+        is_verified tinyint(1) DEFAULT 0 NOT NULL,
+        submission_date datetime DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        PRIMARY KEY  (id)
+    ) ".$wpdb->get_charset_collate().";";
+
+    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+    dbDelta($sql);
+}
+
+
+
+// 2. Modified REST API endpoint
+add_action('acf/init', function () {
+    global $acf_field_options;
+    $acf_field_options = [
+        'experience'  => get_acf_field_slugs('experience_mcq_options'),
+        'industry'    => get_acf_field_slugs('industry_mcq_options'),
+        'outcomes'    => get_acf_field_slugs('outcomes_mcq_options'),
+        'dedication'  => get_acf_field_slugs('dedication_mcq_options'),
+        'challenges'  => get_acf_field_slugs('challenges_mcq_options'),
+        'areas'       => get_acf_field_slugs('focus_areas_mcq_option'),
+        'salary'      => get_acf_field_slugs('salary_mcq_options')
+    ];
+});
+
+function get_acf_field_slugs($field_name) {
+    if (!function_exists('get_field')) {
+        return [];
+    }
+
+    $args = [
+        'post_type'      => 'reports',
+        'post_status'    => 'publish',
+        'posts_per_page' => -1,
+        'order'          => 'ASC',
+    ];
+
+    $query = new WP_Query($args);
+    $values = [];
+
+    if ($query->have_posts()) {
+        while ($query->have_posts()) {
+            $query->the_post();
+            $field_value = get_field($field_name);
+            if ($field_value) {
+                if (is_array($field_value)) {
+                    foreach ($field_value as $value) {
+                        $values[] = sanitize_title($value);
+                    }
+                } else {
+                    $values[] = sanitize_title($field_value);
+                }
+            }
+        }
+    }
+    wp_reset_postdata();
+
+    return array_unique($values);
+}
+
+add_action('rest_api_init', function () {
+    global $acf_field_options;
+
+    function create_validation_callback($valid_options) {
+        return function($param) use ($valid_options) {
+            return in_array($param, $valid_options);
+        };
+    }
+
+    register_rest_route('api', '/submit', [
+        'methods'  => 'POST',
+        'callback' => 'handle_form_submission',
+        'args'     => [
+            'name'       => ['required' => true, 'sanitize_callback' => 'sanitize_text_field'],
+            'email'      => ['required' => true, 'validate_callback' => 'is_email'],
+            'phone'      => [
+                'required'          => true,
+                'validate_callback' => function ($param) {
+                    return preg_match('/^\+?[0-9]{7,15}$/', $param);
+                }
+            ],
+            'experience'  => ['required' => true, 'validate_callback' => create_validation_callback($acf_field_options['experience'])],
+            'industry'    => ['required' => true, 'validate_callback' => create_validation_callback($acf_field_options['industry'])],
+            'outcomes'    => ['required' => true, 'validate_callback' => create_validation_callback($acf_field_options['outcomes'])],
+            'dedication'  => ['required' => true, 'validate_callback' => create_validation_callback($acf_field_options['dedication'])],
+            'challenges'  => ['required' => true, 'validate_callback' => create_validation_callback($acf_field_options['challenges'])],
+            'areas'       => ['required' => true, 'validate_callback' => create_validation_callback($acf_field_options['areas'])],
+            'salary'      => ['required' => true, 'validate_callback' => create_validation_callback($acf_field_options['salary'])],
+        ]
+    ]);
+
+    register_rest_route('api', '/verify', [
+        'methods'  => 'POST',
+        'callback' => 'verify_otp',
+        'permission_callback' => '__return_true'
+    ]);
+});
+
+
+// 3. Form handling and PDF selection logic
+function generate_otp() {
+    return mt_rand(100000, 999999);
+}
+
+function handle_form_submission(WP_REST_Request $request) {
+    session_start();
+    include_once('config.php');
+    global $wpdb;
+
+    $params = $request->get_params();
+
+    // Generate OTP
+    $otp = mt_rand(100000, 999999);
+    
+    // Hash the OTP before storing it
+    $hashed_otp = password_hash($otp, PASSWORD_DEFAULT);
+
+    // Store submission with hashed OTP
+    $wpdb->insert($wpdb->prefix . 'form_submissions', [
+        'name' => sanitize_text_field($params['name']),
+        'email' => sanitize_email($params['email']),
+        'phone' => sanitize_text_field($params['phone']),
+        'experience' => $params['experience'],
+        'industry' => sanitize_text_field($params['industry']),
+        'outcomes' => sanitize_text_field($params['outcomes']),
+        'dedication' => sanitize_text_field($params['dedication']),
+        'salary' => $params['salary'],
+        'otp' => $hashed_otp, // Store the hashed OTP
+        'submission_date' => current_time('mysql')
+    ]);
+
+    // Send OTP to user via email
+    $mail_sent = send_otp_email($params['email'], $params['name'], $otp);
+
+    return new WP_REST_Response([
+        'status'  => $mail_sent,
+        'message' => $mail_sent ? 'OTP sent successfully' : 'Error sending OTP'
+    ], $mail_sent ? 200 : 500);
+}
+
+
+function send_otp_email($to, $name, $otp) {
+    $mail = new PHPMailer(true);
+    
+    try {
+        // Configure SMTP (Use secure storage for credentials)
+        $mail->isSMTP();
+        $mail->Host = 'smtp.gmail.com';  // Specify main SMTP server
+        $mail->SMTPAuth = true;  // Enable SMTP authentication
+        $mail->Username = 'himanshu.khanna@terralogic.com'; 
+        $mail->Password = 'qriy nglw litk larv';
+        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;  // Enable TLS encryption
+        $mail->Port = 587;  // TCP port to connect to
+
+        $mail->setFrom('no-reply@example.com', 'Verification Service');
+        $mail->addAddress($to);
+        $mail->isHTML(true);
+        $mail->Subject = 'Your OTP for Verification';
+        $mail->Body = "<p>Hello $name,</p><p>Your OTP for verification is: <strong>$otp</strong></p>";
+
+        return $mail->send();
+    } catch (Exception $e) {
+        error_log('Email Error: '.$e->getMessage());
+        return false;
+    }
+}
+
+function verify_otp(WP_REST_Request $request) {
+    global $wpdb;
+
+    // Get parameters from the request
+    $email = sanitize_email($request->get_param('email'));
+    $otp = sanitize_text_field($request->get_param('otp'));
+
+    // Fetch the latest submission for this email
+    $table_name = $wpdb->prefix . 'form_submissions';
+    $latest_submission = $wpdb->get_row(
+        $wpdb->prepare(
+            "SELECT * FROM $table_name WHERE email = %s ORDER BY id DESC LIMIT 1",
+            $email
+        )
+    );
+
+    if (!$latest_submission) {
+        return new WP_REST_Response([
+            'status'  => false,
+            'message' => 'Email not found in records.'
+        ], 400);
+    }
+
+    // Verify the OTP
+    if (password_verify($otp, $latest_submission->otp)) {
+
+        // Update is_verified to true (1) for the latest user entry
+        $updated = $wpdb->update(
+            $table_name,
+            ['is_verified' => 1],  // Updating the is_verified field
+            ['id' => $latest_submission->id],   // Where condition (latest entry)
+            ['%d'], // Data format (integer)
+            ['%d']  // Where condition format (integer)
+        );
+
+        if ($updated === false) {
+            return new WP_REST_Response([
+                'status'  => 'error',
+                'message' => 'Database update failed'
+            ], 500);
+        }
+
+        // OTP is correct, now send the PDFs
+        $pdfs = determine_pdfs(
+            $latest_submission->experience,
+            explode(',', $latest_submission->industry),
+            explode(',', $latest_submission->outcomes),
+            explode(',', $latest_submission->dedication),
+            $latest_submission->salary
+        );
+
+        $mail_sent = send_pdf_email(
+            $latest_submission->email,
+            $latest_submission->name,
+            $pdfs
+        );
+
+        return new WP_REST_Response([
+            'status'  => $mail_sent ? 'success' : 'error',
+            'message' => $mail_sent ? 'OTP verified, and PDFs sent successfully' : 'OTP verified, but error sending email',
+            'email'   => $email,
+            'is_verified' => true,
+            'pdfs'    => $pdfs
+        ], $mail_sent ? 200 : 500);
+
+    } else {
+        return new WP_REST_Response([
+            'status'  => false,
+            'message' => 'Invalid OTP. Please try again.'
+        ], 400);
+    }
+}
+
+
+
+// 4. PDF Selection Algorithm
+function determine_pdfs($experience, $industry, $outcomes, $dedication, $challenges, $areas, $salary) {
+    // PDF map based on experience and salary
+    $pdf_map = [
+        '0-3-years' => [
+            'less-than-6-lakhs-per-anum'       => ['starter-guide.pdf'],
+            '6-12-lpa'     => ['career-growth.pdf'],
+            '13-18-lpa'   => ['advanced-skills.pdf'],
+            '19-24-lpa'  => ['executive-tips.pdf']
+        ],
+        '4-6 Years' => [
+            'default' => ['management-handbook.pdf']
+        ],
+        '7-9 Years' => [
+            'default' => ['mid-level-leadership.pdf']
+        ],
+        '10-13 Years' => [
+            'default' => ['senior-management.pdf']
+        ],
+        '13-15 Years' => [
+            'default' => ['executive-strategies.pdf']
+        ],
+        '16+ Years' => [
+            'management'       => ['ceo-insights.pdf'],
+            'entrepreneurship' => ['business-innovations.pdf']
+        ]
+    ];
+
+    $selected_pdfs = [];
+
+    // Experience-based selection: choose PDFs based on experience and salary
+    if (isset($pdf_map[$experience])) {
+        if (isset($pdf_map[$experience][$salary])) {
+            $selected_pdfs = array_merge($selected_pdfs, $pdf_map[$experience][$salary]);
+        } elseif (isset($pdf_map[$experience]['default'])) {
+            $selected_pdfs = array_merge($selected_pdfs, $pdf_map[$experience]['default']);
+        }
+    }
+
+    // Additional PDFs based on outcomes (multiple inputs possible)
+    $outcomes_map = [
+        'advance-within-my-current-role'            => 'current-role-advancement.pdf',
+        'Pursue Leadership and Managerial Positions' => 'team-management.pdf',
+        'Switch to a Different Industry'             => 'industry-switch.pdf',
+        'Share Expertise/ Become a Mentor'           => 'mentorship-guide.pdf',
+        'Pursue Entrepreneurial Endeavors'           => 'startup-tips.pdf',
+        'Build a Professional Network'               => 'networking-tips.pdf',
+        'Be Updated with Industry Evolution'         => 'industry-evolution.pdf'
+    ];
+    foreach ($outcomes as $goal) {
+        if (isset($outcomes_map[$goal])) {
+            $selected_pdfs[] = $outcomes_map[$goal];
+        }
+    }
+
+    // Additional PDFs based on industry (multiple inputs possible)
+    $industry_map = [
+        'technology-and-digital-services'    => 'tech-trends.pdf',
+        'Design'                           => 'design-inspiration.pdf',
+        'Data Science & Business Analytics'=> 'data-insights.pdf',
+        'AI & Machine Learning'            => 'ai-future.pdf',
+        'Cloud Computing'                  => 'cloud-guide.pdf',
+        'Banking & Financial Services'     => 'finance-strategies.pdf',
+        'Cyber Security'                   => 'cybersecurity.pdf',
+        'Management'                       => 'management-bestpractices.pdf',
+        'Human Resource'                   => 'hr-tactics.pdf',
+        'Others'                           => 'industry-overview.pdf'
+    ];
+    foreach ($industry as $ind) {
+        if (isset($industry_map[$ind])) {
+            $selected_pdfs[] = $industry_map[$ind];
+        }
+    }
+
+    // Optionally, you can add logic based on dedication here if needed
+
+    return array_unique($selected_pdfs);
+}
+
+
+
+// 5. Email sending with PDF attachments
+function send_pdf_email($email, $name, $pdfs) {
+    global $wpdb;
+
+    // Ensure user is verified before sending PDFs
+    $is_verified = $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT is_verified FROM {$wpdb->prefix}form_submissions WHERE email = %s ORDER BY id DESC LIMIT 1",
+            $email
+        )
+    );    
+    // echo '<pre>';
+    // print_r($is_verified);
+    // echo '</pre>';
+
+    if ($is_verified != 1) {
+        // echo '<pre>';
+        // print_r('not verified');
+        // echo '</pre>';
+        return false; // Do not send PDFs if user is not verified
+    }
+
+    $mail = new PHPMailer(true);
+    
+    try {
+        // Configure SMTP (from previous setup)
+        $mail->isSMTP();
+        $mail->Host = 'smtp.gmail.com';  // Specify main SMTP server
+        $mail->SMTPAuth = true;  // Enable SMTP authentication
+        $mail->Username = 'himanshu.khanna@terralogic.com'; 
+        $mail->Password = 'qriy nglw litk larv';
+        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;  // Enable TLS encryption
+        $mail->Port = 587;  // TCP port to connect to
+
+        // Optionally check SMTP connection explicitly
+        if (!$mail->smtpConnect()) {
+            echo "<script>console.error('Failed to connect to SMTP server for {$email}.');</script>";
+            error_log("Failed to connect to SMTP server for {$email}.");
+            die;
+        }
+        echo "<script>console.log('smtp connected');</script>";
+        echo '<pre>';
+        print_r($pdfs);
+        echo '</pre>';
+
+        $mail->isHTML(true);
+        // Email content
+        $mail->setFrom('careers@example.com', 'Career Services');
+        $mail->addAddress($email);
+        $mail->Subject = 'Your Custom Career Resources';
+
+        // Attach PDFs from uploads directory
+        $uploads_dir = wp_upload_dir()['basedir'].'/career-pdfs/';
+        foreach ($pdfs as $pdf) {
+            $path = $uploads_dir.sanitize_file_name($pdf);
+            if (file_exists($path)) {
+                $mail->addAttachment($path);
+            }
+        }
+
+        // HTML body with personalized message
+        $mail->Body = "
+            <h1>Hi $name!</h1>
+            <p>Based on your experience and goals, we're sending these resources:</p>
+            <ul>
+                <li>".implode('</li><li>', $pdfs)."</li>
+            </ul>
+        ";
+
+        return $mail->send();
+    } catch (Exception $e) {
+        error_log('Email Error: '.$e->getMessage());
+        return false;
+    }
+}
+
+$data = [];
+$i = 0;
+$args = array(
+    'post_type'      => 'reports',
+    'post_status'    => 'publish',
+    'posts_per_page' => -1,
+    'order'          => 'ASC',
+);
+
+$query = new WP_Query($args);
+if ($query->have_posts()) {
+
+    while ($query->have_posts()) {
+
+        $query->the_post();
+        global $post;
+        $post_id = $post->ID;
+
+        // Get the selected values from your ACF field.
+        $experience = get_field("experience_mcq_options"); // Expected to be an array
+        $industry = get_field("industry_mcq_options"); // Expected to be an array
+        $outcomes = get_field("outcomes_mcq_options"); // Expected to be an array
+        $dedication = get_field("dedication_mcq_options"); // Expected to be an array
+        $challenges = get_field("challenges_mcq_options"); // Expected to be an array
+        $areas = get_field("focus_areas_mcq_option"); // Expected to be an array
+        $salary = get_field("salary_mcq_options"); // Expected to be an array
+        // Cast to array in case any of these returns false or null
+        $options = array_merge((array)$experience,(array)$industry,(array)$outcomes,(array)$dedication,(array)$challenges,(array)$areas,(array)$salary);
+        $answer_values = array();
+    
+        if ($options && is_array($options)) {
+            foreach ($options as $value) {
+                $answer_values[] = array(
+                    'slug' => sanitize_title($value) // Converts to a URL-friendly slug
+                );
+            }
+        } else {
+            // Fallback for a single value scenario
+            foreach ($options as $value) {
+            $answer_values[] = array(
+                'slug' => sanitize_title($options)
+            );
+        }}
+        
+        $post_data['answer'] = array(
+            'layout'       => 'mcq_options',
+            'answer_value' => $answer_values
+        );
+
+        $post_data = array_filter($post_data, function ($value) {
+            return !empty($value);
+        });
+
+        $data['reports'][] = $post_data;
+
+    }
+    wp_reset_postdata();
+}
